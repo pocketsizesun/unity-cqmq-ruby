@@ -1,0 +1,149 @@
+Parameters:
+  LambdaArchitecture:
+    Type: String
+    Default: x86_64
+    AllowedValues:
+      - x86_64
+      - arm64
+  LambdaRoleName:
+    Type: String
+    Default: UnityCQMQLambdaFunction
+  ClientQueuePrefix:
+    Type: String
+    Default: cqmq-cl
+  ScheduleExpression:
+    Type: String
+    Default: "rate(1 hour)"
+Resources:
+  LambdaFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Ref LambdaRoleName
+      MaxSessionDuration: 43200
+      Path: '/'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        -
+          Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action: sts:AssumeRole
+      Policies:
+        -
+          PolicyName: 'SQSAccess'
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              -
+                Effect: Allow
+                Action:
+                  - sqs:ListQueues
+                  - sqs:ListQueueTags
+                  - sqs:DeleteQueue
+                Resource:
+                  - !Sub arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${ClientQueuePrefix}-*
+
+  # LAMBDA FUNCTIONS
+  LambdaFunction:
+    Type: AWS::Lambda::Function
+    DependsOn:
+      - LambdaFunctionRole
+    Properties:
+      Role: !GetAtt LambdaFunctionRole.Arn
+      Runtime: nodejs14.x
+      Handler: index.handler
+      Timeout: 300
+      MemorySize: 128
+      Architectures:
+        - !Ref LambdaArchitecture
+      Environment:
+        Variables:
+          CQMQ_CLIENT_QUEUE_PREFIX: !Ref ClientQueuePrefix
+      Code:
+        ZipFile: |
+          'use strict';
+          const AWS = require('aws-sdk');
+          const sqs = new AWS.SQS();
+
+          let deletedQueuesCount = 0;
+
+          async function cleanupQueues(nextToken, resolve) {
+            const listQueuesParameters = {
+              QueueNamePrefix: process.env.CQMQ_CLIENT_QUEUE_PREFIX,
+              MaxResults: 500
+            };
+            if (nextToken !== null) {
+              listQueuesParameters.NextToken = nextToken;
+            }
+            let result = await sqs.listQueues(listQueuesParameters).promise();
+            if (!result.QueueUrls) {
+              return resolve(deletedQueuesCount);
+            }
+
+            for (let index = 0; index < result.QueueUrls.length; index++) {
+              const queueUrl = result.QueueUrls[index];
+              try {
+                let listQueueTagsResult = await sqs.listQueueTags({ QueueUrl: queueUrl }).promise();
+                if (listQueueTagsResult.Tags && Number(listQueueTagsResult.Tags['unity-cqmq:HeartbeatAt']) + 600 < Math.floor(Date.now() / 1000)) {
+                  try {
+                    await sqs.deleteQueue({ QueueUrl: queueUrl }).promise();
+                  } catch(err) {
+                    // do nothing
+                  }
+                  deletedQueuesCount++;
+                }
+              } catch(err) {
+                console.log(err);
+              }
+
+            }
+
+            if (result.NextToken) {
+              setTimeout(() => { cleanupQueues(result.NextToken, resolve); }, 1000);
+            } else {
+              resolve(deletedQueuesCount);
+            }
+          }
+
+          exports.handler = async (event, context, callback) => {
+            const promise = new Promise((resolve, reject) => {
+              cleanupQueues(null, resolve);
+            });
+            return promise;
+          };
+
+  LambdaFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    DependsOn:
+      - LambdaFunction
+    Properties:
+      RetentionInDays: 1
+      LogGroupName:
+        Fn::Sub:
+          - "/aws/lambda/${FunctionName}"
+          -
+            FunctionName: !Ref LambdaFunction
+
+  EventBridgeRule:
+    Type: AWS::Events::Rule
+    DependsOn:
+      - LambdaFunction
+    Properties:
+      Description: Periodically executes Unity CQMQ queue cleanup
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        -
+          Id: TargetLambdaFunction
+          Arn: !GetAtt LambdaFunction.Arn
+
+  EventBridgeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - EventBridgeRule
+    Properties:
+      FunctionName: !GetAtt LambdaFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EventBridgeRule.Arn

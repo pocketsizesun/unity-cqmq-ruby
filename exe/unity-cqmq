@@ -1,0 +1,98 @@
+#!/usr/bin/env ruby
+
+require 'optparse'
+require 'bundler/setup'
+require 'unity/cqmq'
+require 'unity/cqmq/processor'
+
+cli_command = ARGV.shift
+
+case cli_command
+when 'queue-cleanup'
+  @options = { timeout: 900 }
+  OptionParser.new do |opts|
+    # --timeout=SECONDS, -t SECONDS
+    opts.on('-t', '--timeout=SECONDS', 'Queue max stale age') do |v|
+      @options[:timeout] = v.to_i
+    end
+  end.parse!
+
+  sqs = Aws::SQS::Client.new
+  deleted_count = 0
+  actives_count = 0
+  list_queues_parameters = {
+    queue_name_prefix: Unity::CQMQ::CLIENT_QUEUE_NAME_PREFIX,
+    max_results: 200
+  }
+
+  loop do
+    result = sqs.list_queues(list_queues_parameters)
+
+    result.queue_urls.each do |queue_url|
+      queue_tags = sqs.list_queue_tags(queue_url: queue_url).tags
+      next unless queue_tags.key?(Unity::CQMQ::CLIENT_QUEUE_HEARTBEAT_TAG_NAME)
+
+      actives_count += 1
+
+      if queue_tags[Unity::CQMQ::CLIENT_QUEUE_HEARTBEAT_TAG_NAME].to_i + @options[:timeout] < Time.now.to_i
+        sqs.delete_queue(queue_url: queue_url)
+        deleted_count += 1
+      end
+
+      sleep 1
+    rescue Aws::SQS::Errors::NonExistentQueue
+      # do nothing
+    end
+
+    break if result.next_token.nil?
+
+    list_queues_parameters[:next_token] = result.next_token
+  end
+
+  Unity::CQMQ.logger&.info "#{deleted_count}/#{actives_count} queues deleted"
+when 'start'
+  @options = {}
+
+  OptionParser.new do |opts|
+    # --require, -r (config/boot.rb)
+    opts.on('-r', '--require=FILE', 'File to require before starting') do |v|
+      @options[:require] = v.to_s
+    end
+
+    # --threads=THREADS_COUNT, -c THREADS_COUNT
+    opts.on('-t', '--threads=THREAD_COUNT', 'Number of processing threads per worker') do |v|
+      @options[:threads] = v.to_i
+    end
+
+    # --workers=WORKERS_COUNT, -w WORKERS_COUNT
+    opts.on('-w', '--workers=WORKERS_COUNT', 'Number of workers') do |v|
+      @options[:workers] = v.to_i
+    end
+
+    # --sqs-wait-time-seconds=SECONDS
+    opts.on('--sqs-wait-time-seconds=LONG_POLL_TIMEOUT', 'Maximum SQS wait time when polling queue') do |v|
+      @options[:sqs_wait_time_seconds] = v.to_i
+    end
+
+    # --log-level=LEVEL, -l LEVEL
+    opts.on('-l', '--log-level=LEVEL', 'Logger level: DEBUG, INFO, WARN, ERROR or FATAL') do |v|
+      @options[:log_level] = \
+        case v.to_s
+        when 'DEBUG' then :DEBUG
+        when 'WARN' then :WARN
+        when 'ERROR' then :ERROR
+        when 'FATAL' then :FATAL
+        else :INFO
+        end
+    end
+  end.parse!
+
+  require 'unity/cqmq/launcher'
+  require File.realpath(@options.fetch(:require))
+
+  unless @options[:log_level].nil?
+    Unity::CQMQ.logger&.level = Logger.const_get(@options[:log_level])
+  end
+  Unity::CQMQ::Launcher.run(@options)
+  Unity::CQMQ.logger&.info 'terminated'
+end
