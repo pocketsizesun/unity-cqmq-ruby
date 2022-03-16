@@ -64,7 +64,6 @@ module Unity
           end
 
           @closed = true
-          puts "close client"
         end
 
         true
@@ -132,20 +131,23 @@ module Unity
         ).queue_url
       end
 
-      def wait_for_reply(request_uuid, timeout: 60)
-        started_at = Time.now.to_i
+      def wait_for_reply(request_uuid, max_retries: 3, wait_time: 20)
+        tries = 0
 
         loop do
-          raise TimeoutError if started_at + timeout < Time.now.to_i
+          raise TimeoutError if tries > max_retries
 
           result = @sqs.receive_message(
             queue_url: @client_queue_url,
             message_attribute_names: RECV_MESSAGE_ATTRIBUTE_NAMES,
             max_number_of_messages: 1,
             visibility_timeout: 30,
-            wait_time_seconds: 20
+            wait_time_seconds: wait_time
           )
-          next if result.messages.length == 0
+          if result.messages.length == 0
+            tries += 1
+            next
+          end
 
           message = result.messages.first
 
@@ -153,7 +155,10 @@ module Unity
             queue_url: @client_queue_url,
             receipt_handle: message.receipt_handle
           )
-          next unless request_uuid == message.message_attributes['request-id'].string_value
+          unless request_uuid == message.message_attributes['request-id'].string_value
+            tries += 1
+            next
+          end
 
           resp_status = message.message_attributes['status'].string_value
           unless resp_status == Unity::CQMQ::STATUS_OK

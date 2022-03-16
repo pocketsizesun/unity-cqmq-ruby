@@ -134,7 +134,7 @@ module Unity
         retries_count = 0
 
         begin
-          message_body = @json_parser.dump(data)
+          message_body = @json_parser.dump(data.respond_to?(:as_json) ? data.as_json : data)
           thread_sqs_client.send_message(
             queue_url: queue_url,
             message_body: message_body,
